@@ -14,9 +14,8 @@
 
 ## 🚀 실행 결과 예시
 
-| 메인화면 | 다운로드 결과 |
-|:--:|:--:|
-| ![메인화면](https://drive.google.com/uc?export=view&id=1ca7wZRwcdSepcrxczrdi8d3Ec-6g6uTG) | ![결과표](https://drive.google.com/uc?export=view&id=1BQ8VL6PBISbpNbmrSaCsA6nk-fEBx2oC) |
+메인화면 : https://drive.google.com/uc?export=view&id=1ca7wZRwcdSepcrxczrdi8d3Ec-6g6uTG
+결과표 : https://drive.google.com/uc?export=view&id=1BQ8VL6PBISbpNbmrSaCsA6nk-fEBx2oC
 
 > 예시: **삼성전자서비스 (2023)** 검색 후 10건의 공시 ZIP 자동 다운로드 결과입니다.  
 > 회사 보안정책상 이미지 파일은 Google Drive를 통해 공유되었습니다.
