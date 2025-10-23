@@ -1,19 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-DART 자동 다운로더 (Streamlit, 안정화 버전)
-- 회사 검색(정확일치 우선 + 부분일치)
-- 연도별 공시 목록 수집
-- 각 공시 ZIP 다운로드 → 묶음 ZIP 제공
-- ZIP 파일명: 제출일_보고서명_접수번호.zip
-- 요약(엑셀/CSV) + DART 바로가기 링크 포함
-
-안정화 포인트
-- corpCode.xml이 ZIP이 아닐 때 원인 메시지 노출
-- 검색 실패 시 마지막 정상 마스터를 재사용
-- selectbox: 레코드(dict) 옵션 + index=None(첫 항목 자동 선택 방지)
-- 새 검색 시 이전 선택/옵션 초기화
-- 현재 검색 결과 개수 항상 표시
-- 캐시 비우기 버튼 제공
+DART 자동 다운로더 (Streamlit, Persist 버전)
+- 결과(df/엑셀/CSV/ZIP)를 st.session_state에 저장하여
+  다운로드 버튼 클릭 후 rerun이 일어나도 화면이 초기화되지 않도록 유지
 """
 
 import os
@@ -29,10 +18,18 @@ from typing import List, Dict, Optional
 import streamlit as st
 
 # ==============================
-# Streamlit Page Config
+# Page & Session
 # ==============================
 st.set_page_config(page_title="DART 자동 다운로더", page_icon="📑", layout="wide")
 st.title("📑 DART 자동 다운로더")
+
+# 세션에 결과 보관용 키들
+RESULT_KEYS = ["last_df", "excel_bytes", "csv_bytes", "zip_bundle_bytes",
+               "last_corp_name", "last_corp_code", "last_year", "last_count"]
+
+def clear_results():
+    for k in RESULT_KEYS:
+        st.session_state.pop(k, None)
 
 # ==============================
 # OpenDART Endpoints / Session
@@ -43,13 +40,12 @@ LIST_API    = f"{API_HOST}/api/list.json"
 DOC_API     = f"{API_HOST}/api/document.xml"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-auto-downloader/streamlit/1.3"})
+S.headers.update({"User-Agent": "dart-auto-downloader/streamlit/1.4"})
 
 # ==============================
 # Utils
 # ==============================
 def sanitize_filename(name: str) -> str:
-    """Windows/macOS/Linux 공통 안전 파일명으로 정리"""
     if not name:
         name = "unknown_report"
     bad = r'\\/:*?"<>|'
@@ -63,27 +59,20 @@ def is_zip(content: bytes) -> bool:
 
 @st.cache_data(show_spinner=False)
 def fetch_corp_master(api_key: str) -> pd.DataFrame:
-    """법인코드 마스터 ZIP(xml) 다운로드 후 DataFrame으로 반환 (캐시)
-       - 응답이 ZIP이 아닐 경우, 에러 메시지를 추출해 안내
-    """
     key = (api_key or "").strip()
     if not key:
         raise RuntimeError("API Key가 비어 있습니다. 올바른 키를 입력하세요.")
-
     try:
         r = S.get(CORPCODE_API, params={"crtfc_key": key}, timeout=60)
     except requests.RequestException as e:
         raise RuntimeError(f"네트워크 오류: {e}")
 
     content = r.content or b""
-    content_type = r.headers.get("Content-Type", "")
-    if not (is_zip(content) or "zip" in (content_type or "").lower()):
-        # ZIP이 아니면 JSON/XML/HTML일 수 있음 → 가능한 메시지 추출
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if not (is_zip(content) or "zip" in ctype):
         txt = ""
-        try:
-            txt = content.decode("utf-8", errors="ignore")
-        except Exception:
-            pass
+        try: txt = content.decode("utf-8", errors="ignore")
+        except Exception: pass
 
         # JSON(status/message)
         try:
@@ -94,8 +83,7 @@ def fetch_corp_master(api_key: str) -> pd.DataFrame:
                 raise RuntimeError(f"OpenDART 오류(status={status}): {message}")
         except Exception:
             pass
-
-        # XML(<message>..</message>)
+        # XML(<message>…)
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(txt)
@@ -106,11 +94,10 @@ def fetch_corp_master(api_key: str) -> pd.DataFrame:
             pass
 
         hint = f" (HTTP {r.status_code})" if r.status_code and r.status_code != 200 else ""
-        if "html" in (content_type or "").lower():
+        if "html" in ctype:
             raise RuntimeError(f"OpenDART에서 ZIP이 아닌 HTML 응답을 반환했습니다{hint}. 잠시 후 다시 시도하거나 API Key/한도를 확인하세요.")
         raise RuntimeError("OpenDART에서 ZIP이 아닌 응답을 반환했습니다. API Key/요청 상태를 확인하세요.")
 
-    # 정상 ZIP 처리
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             with zf.open(zf.namelist()[0]) as fp:
@@ -131,44 +118,31 @@ def fetch_corp_master(api_key: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def search_companies(master: pd.DataFrame, query: str) -> pd.DataFrame:
-    """회사명 검색 (정확일치 + 부분일치 동시 표출, 정확일치 우선)"""
     q = (query or "").strip()
     if not q:
         return master.head(0)
-
     m = master.copy()
     m["__norm"] = m["corp_name"].fillna("").str.replace(r"\s+", "", regex=True)
     qn = re.sub(r"\s+", "", q)
-
     # 정확일치
     mask_exact = m["__norm"].str.casefold() == qn.casefold()
-    exact = m[mask_exact].copy()
-    exact["__rank"] = 0
-
+    exact = m[mask_exact].copy(); exact["__rank"] = 0
     # 부분일치
     mask_part = m["__norm"].str.contains(re.escape(qn), case=False, regex=True)
-    part = m[mask_part & (~mask_exact)].copy()
-    part["__rank"] = 1
-
-    # 합치고 정렬 (상장사 우선)
+    part = m[mask_part & (~mask_exact)].copy(); part["__rank"] = 1
     res = pd.concat([exact, part], ignore_index=True)
     res["__listed"] = res["stock_code"].fillna("").ne("")
     res = res.sort_values(by=["__rank", "__listed", "corp_name"], ascending=[True, False, True])
     return res.head(200).drop(columns=["__norm", "__rank", "__listed"], errors="ignore")
 
 def fetch_list(api_key: str, corp_code: str, year: str) -> List[Dict]:
-    """연도별 공시 목록 수집(list.json 페이지네이션 처리)"""
-    out = []
-    page_no = 1
+    out = []; page_no = 1
     bgn_de = f"{year}0101"; end_de = f"{year}1231"
     while True:
         params = {
-            "crtfc_key": api_key,
-            "corp_code": corp_code,
-            "bgn_de": bgn_de,
-            "end_de": end_de,
-            "page_no": page_no,
-            "page_count": 100,
+            "crtfc_key": api_key, "corp_code": corp_code,
+            "bgn_de": bgn_de, "end_de": end_de,
+            "page_no": page_no, "page_count": 100,
         }
         r = S.get(LIST_API, params=params, timeout=60)
         r.raise_for_status()
@@ -181,11 +155,10 @@ def fetch_list(api_key: str, corp_code: str, year: str) -> List[Dict]:
         if len(out) >= total or not items:
             break
         page_no += 1
-        time.sleep(0.08)  # API 예의상 약간 대기
+        time.sleep(0.08)
     return out
 
 def download_zip_bytes(api_key: str, rcept_no: str) -> Optional[bytes]:
-    """document.xml ZIP 원문(바이트) 반환"""
     params = {"crtfc_key": api_key, "rcept_no": rcept_no}
     r = S.get(DOC_API, params=params, timeout=60)
     content = r.content or b""
@@ -199,6 +172,44 @@ def make_excel_bytes(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False)
     buf.seek(0)
     return buf.read()
+
+def render_results():
+    """세션에 저장된 결과가 있으면 표/다운로드 버튼을 렌더."""
+    df = st.session_state.get("last_df")
+    if df is None:
+        return
+    corp_name = st.session_state.get("last_corp_name", "")
+    corp_code = st.session_state.get("last_corp_code", "")
+    year = st.session_state.get("last_year", "")
+    count = st.session_state.get("last_count", len(df))
+
+    st.dataframe(df, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button(
+            "📊 요약 엑셀 받기",
+            data=st.session_state.get("excel_bytes"),
+            file_name=f"공시ZIP요약_{year}_{sanitize_filename(corp_name)}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            "📄 요약 CSV 받기",
+            data=st.session_state.get("csv_bytes"),
+            file_name=f"공시ZIP요약_{year}_{sanitize_filename(corp_name)}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c3:
+        st.download_button(
+            "🧾 ZIP 일괄 다운로드",
+            data=st.session_state.get("zip_bundle_bytes"),
+            file_name=f"DART_{year}_{sanitize_filename(corp_name)}_{corp_code}_ZIP묶음.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    st.success(f"완료! 총 {count}건 처리 결과가 유지되었습니다.")
 
 # ==============================
 # Sidebar (입력 & 유틸)
@@ -217,7 +228,7 @@ query = st.sidebar.text_input("회사명 검색 (부분일치 가능)", value=""
 exact_only = st.sidebar.checkbox("정확히 일치한 회사만 보기", value=False)
 run_search = st.sidebar.button("회사 검색")
 
-# 캐시 비우기(선택)
+# 캐시 비우기
 if st.sidebar.button("캐시 비우기"):
     st.cache_data.clear()
     st.sidebar.success("캐시를 비웠습니다. 다시 검색해 주세요.")
@@ -226,15 +237,16 @@ if st.sidebar.button("캐시 비우기"):
 # 검색 버튼 처리 (안전화)
 # ==============================
 if api_key and run_search:
-    # 새 검색이면 이전 선택/검색 결과 초기화
+    # 새 검색이면 이전 선택/검색 결과/결과표 초기화
     st.session_state.pop("company_selectbox", None)
     st.session_state.pop("selected_company", None)
     st.session_state.pop("search_options", None)
+    clear_results()
 
     try:
         with st.spinner("회사 목록(마스터) 가져오는 중…"):
             master = fetch_corp_master(api_key)
-            st.session_state["corp_master_cache"] = master  # 최신본 캐시
+            st.session_state["corp_master_cache"] = master
     except Exception as e:
         master = st.session_state.get("corp_master_cache")
         if master is None:
@@ -243,7 +255,6 @@ if api_key and run_search:
         else:
             st.sidebar.warning(f"마스터 다운로드 실패 → 마지막 정상본으로 검색합니다. (사유: {e})")
 
-    # 여기서 master는 반드시 존재
     cand = search_companies(master, query or "")
     if exact_only and (query or "").strip():
         qn = re.sub(r"\s+", "", query or "")
@@ -279,20 +290,18 @@ with left:
     selected_row = st.selectbox(
         "회사 선택",
         options=options,
-        index=None,  # 첫 항목 자동선택 방지
+        index=None,
         format_func=lambda r: r.get("_label", "회사 선택") if isinstance(r, dict) else "회사 선택",
         key="company_selectbox",
         placeholder="회사 검색 후 선택하세요",
     )
 
-    # 선택되면 즉시 세션 저장
     if isinstance(selected_row, dict):
         st.session_state["selected_company"] = {
             "corp_code": selected_row["corp_code"],
             "corp_name": selected_row["corp_name"],
         }
 
-    # 선택 확인
     if "selected_company" in st.session_state:
         sc = st.session_state["selected_company"]
         st.info(f"선택된 회사: **{sc['corp_name']}** (corp_code: `{sc['corp_code']}`)")
@@ -301,8 +310,9 @@ with left:
 
 with right:
     st.subheader("결과")
-    table_ph = st.empty()
-    dl_ph = st.empty()
+
+    # ✅ 이전에 생성된 결과가 있으면 즉시 렌더(버튼을 누르지 않아도 유지)
+    render_results()
 
 # ==============================
 # Action: 다운로드 & 요약 생성
@@ -317,13 +327,13 @@ if run_download:
         st.error("연도 형식이 올바르지 않습니다. 예: 2024")
     else:
         corp_code = sc["corp_code"]; corp_name = sc["corp_name"]
-
         try:
             with st.spinner("공시 목록 수집 중…"):
                 items = fetch_list(api_key, corp_code, year)
 
             if not items:
                 st.info("해당 연도에 수집할 공시가 없습니다.")
+                clear_results()
             else:
                 progress = st.progress(0, text="ZIP 다운로드 준비 중…")
                 total = len(items)
@@ -355,44 +365,23 @@ if run_download:
                         })
 
                         progress.progress(min(i / total, 1.0), text=f"다운로드 중… ({i}/{total})")
-                        time.sleep(0.06)  # API 예의상 살짝 대기
+                        time.sleep(0.06)
 
                 df = pd.DataFrame(summary).sort_values(["제출일", "보고서명"], ascending=[False, True])
-                table_ph.dataframe(df, use_container_width=True)
 
-                # 다운로드 파일들
-                excel_bytes = make_excel_bytes(df)
-                csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+                # 🔒 결과를 세션에 저장 → 다음 rerun에도 유지
+                st.session_state["last_df"] = df
+                st.session_state["excel_bytes"] = make_excel_bytes(df)
+                st.session_state["csv_bytes"] = df.to_csv(index=False).encode("utf-8-sig")
                 bundle_buf.seek(0)
-                zip_bundle_bytes = bundle_buf.read()
+                st.session_state["zip_bundle_bytes"] = bundle_buf.read()
+                st.session_state["last_corp_name"] = corp_name
+                st.session_state["last_corp_code"] = corp_code
+                st.session_state["last_year"] = year
+                st.session_state["last_count"] = len(df)
 
-                with dl_ph:
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.download_button(
-                            "📊 요약 엑셀 받기",
-                            data=excel_bytes,
-                            file_name=f"공시ZIP요약_{year}_{sanitize_filename(corp_name)}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
-                    with c2:
-                        st.download_button(
-                            "📄 요약 CSV 받기",
-                            data=csv_bytes,
-                            file_name=f"공시ZIP요약_{year}_{sanitize_filename(corp_name)}.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                        )
-                    with c3:
-                        st.download_button(
-                            "🧾 ZIP 일괄 다운로드",
-                            data=zip_bundle_bytes,
-                            file_name=f"DART_{year}_{sanitize_filename(corp_name)}_{corp_code}_ZIP묶음.zip",
-                            mime="application/zip",
-                            use_container_width=True,
-                        )
-
-                st.success(f"완료! 총 {len(df)}건 처리했습니다.")
+                # 즉시 렌더
+                render_results()
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
+            clear_results()
