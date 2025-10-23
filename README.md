@@ -8,7 +8,7 @@
 
 ## 🌐 실행 데모
 
-🔗 [https://sjhvske89mkq52qn9tmk.streamlit.app](https://sjhvske89mkq52qn9tmk.streamlit.app)
+🔗 [https://sjhvske89mknqc52qn9tmk.streamlit.app](https://sjhvske89mknqc52qn9tmk.streamlit.app)
 
 ---
 
